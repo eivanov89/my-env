@@ -1,0 +1,36 @@
+export Y_FAST_CANCEL="yes"
+
+if [ -f '/home/eivanov89/ydb/path.bash.inc' ]; then
+    source '/home/eivanov89/ydb/path.bash.inc';
+fi
+
+export BUILD_CORES="${BUILD_CORES:-$(nproc --ignore=2)}"
+
+alias cds='cd ~/repos/ydb/ydb'
+
+function ymake_impl() {
+    profile=$1
+    shift
+
+    ya make -j${BUILD_CORES} --build=$profile $@
+}
+
+function ymr() {
+    ymake_impl release -DCFLAGS=-fno-omit-frame-pointer $@
+}
+
+function ymp() {
+    ymake_impl profile -DCFLAGS=-fno-omit-frame-pointer $@
+}
+
+function yma() {
+    ymake_impl debug --sanitize=address $@
+}
+
+function ymd() {
+    ymake_impl debug $@
+}
+
+function yml() {
+    ymake_impl debug --sanitize=leak $@
+}
