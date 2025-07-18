@@ -27,6 +27,10 @@ function yma() {
     ymake_impl debug --sanitize=address $@
 }
 
+function ymt() {
+    ymake_impl debug --sanitize=thread $@
+}
+
 function ymd() {
     ymake_impl debug $@
 }
