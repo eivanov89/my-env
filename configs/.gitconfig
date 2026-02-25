@@ -1,0 +1,9 @@
+[user]
+	name = Evgeniy Ivanov
+	email = i@eivanov.com
+[alias]
+	co = checkout
+	sw = switch
+	st = status
+	lg = log --oneline --graph --decorate
+	br = branch
