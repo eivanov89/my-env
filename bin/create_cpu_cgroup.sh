@@ -253,14 +253,65 @@ if [ "$CGROUP_MODE" = "v2" ]; then
   sudo systemctl set-property --runtime user.slice AllowedCPUs="${OTHER_CPU_LIST}"
 
   current_unit="$(detect_systemd_unit_for_pid "${PPID}" || true)"
+  service_unit=""
+  isolated_cgroup_dir=""
+  service_cgroup_dir=""
 
   echo
-  if [ -n "$current_unit" ]; then
+  if [[ "$current_unit" == *.scope ]]; then
     echo "Setting current unit '${current_unit}' AllowedCPUs=${ISO_CPU_LIST}"
     sudo systemctl set-property --runtime "${current_unit}" AllowedCPUs="${ISO_CPU_LIST}"
     echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+  elif [[ "$current_unit" == *.service ]]; then
+    # System-wide services (e.g. ssh.service) contain unrelated processes.
+    # Move PPID into a new peer cgroup, then constrain the service to OTHER CPUs.
+    service_unit="$current_unit"
+    current_unit=""
+
+    service_cgroup="$(systemctl show -p ControlGroup --value "$service_unit" 2>/dev/null || true)"
+    if [ -n "$service_cgroup" ]; then
+      service_cgroup_dir="${CPUSET_ROOT}${service_cgroup}"
+      parent_cgroup_dir="$(dirname "$service_cgroup_dir")"
+      isolated_cgroup_dir="${parent_cgroup_dir}/bench-isolated-${PPID}"
+
+      parent_subtree="$(cat "${parent_cgroup_dir}/cgroup.subtree_control" 2>/dev/null || true)"
+      case " ${parent_subtree} " in
+        *" cpuset "*) ;;
+        *)
+          echo "Enabling cpuset in $(basename "$parent_cgroup_dir") subtree_control"
+          echo "+cpuset" | sudo tee "${parent_cgroup_dir}/cgroup.subtree_control" >/dev/null
+          ;;
+      esac
+
+      echo "Creating isolated cgroup ${isolated_cgroup_dir}"
+      sudo mkdir -p "$isolated_cgroup_dir"
+      echo "$ISO_CPU_LIST" | sudo tee "${isolated_cgroup_dir}/cpuset.cpus" >/dev/null
+
+      echo "Moving shell PID ${PPID} into isolated cgroup"
+      echo "$PPID" | sudo tee "${isolated_cgroup_dir}/cgroup.procs" >/dev/null
+
+      echo "Setting ${service_unit} AllowedCPUs=${OTHER_CPU_LIST}"
+      sudo systemctl set-property --runtime "$service_unit" AllowedCPUs="${OTHER_CPU_LIST}"
+
+      echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+    else
+      echo "Warning: could not determine ControlGroup for ${service_unit}; falling back to taskset." >&2
+      service_unit=""
+      if command -v taskset >/dev/null 2>&1; then
+        echo "Pinning current shell PID ${PPID} to ${ISO_CPU_LIST} via taskset"
+        taskset -pc "${ISO_CPU_LIST}" "${PPID}" >/dev/null
+        fallback_taskset_pid="${PPID}"
+        echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+      else
+        echo "Warning: taskset not found. Run an isolated shell with:" >&2
+        echo "  systemd-run --scope -p AllowedCPUs=${ISO_CPU_LIST} --same-dir bash"
+      fi
+    fi
   else
     fallback_other_unit="$(detect_ancestor_systemd_unit "${PPID}" || true)"
+    case "$fallback_other_unit" in
+      *.service) fallback_other_unit="" ;;
+    esac
     if [ -n "$fallback_other_unit" ]; then
       echo "Current shell has no direct unit; setting ancestor unit '${fallback_other_unit}' AllowedCPUs=${OTHER_CPU_LIST}"
       sudo systemctl set-property --runtime "${fallback_other_unit}" AllowedCPUs="${OTHER_CPU_LIST}"
@@ -285,6 +336,9 @@ if [ "$CGROUP_MODE" = "v2" ]; then
     echo "OTHER_CPU_LIST=${OTHER_CPU_LIST}"
     echo "ROOT_CPU_LIST=${ROOT_CPU_LIST}"
     echo "CURRENT_UNIT=${current_unit}"
+    echo "SERVICE_UNIT=${service_unit}"
+    echo "ISOLATED_CGROUP_DIR=${isolated_cgroup_dir}"
+    echo "SERVICE_CGROUP_DIR=${service_cgroup_dir}"
     echo "FALLBACK_OTHER_UNIT=${fallback_other_unit}"
     echo "FALLBACK_TASKSET_PID=${fallback_taskset_pid}"
   } > "${STATE_FILE}"

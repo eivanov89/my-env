@@ -53,20 +53,47 @@ if [ "$CGROUP_MODE" = "v2" ]; then
   sudo systemctl set-property --runtime user.slice AllowedCPUs="${ROOT_CPU_LIST}"
 
   current_scope=""
+  service_unit=""
+  isolated_cgroup_dir=""
+  service_cgroup_dir=""
   fallback_other_unit=""
   fallback_taskset_pid=""
   if [ -f "${STATE_FILE}" ]; then
     # shellcheck disable=SC1090
     . "${STATE_FILE}"
     current_scope="${CURRENT_UNIT:-}"
+    service_unit="${SERVICE_UNIT:-}"
+    isolated_cgroup_dir="${ISOLATED_CGROUP_DIR:-}"
+    service_cgroup_dir="${SERVICE_CGROUP_DIR:-}"
     fallback_other_unit="${FALLBACK_OTHER_UNIT:-}"
     fallback_taskset_pid="${FALLBACK_TASKSET_PID:-}"
   fi
 
-  if [[ "$current_scope" == *.scope || "$current_scope" == *.service || "$current_scope" == *.slice ]]; then
+  if [[ "$current_scope" == *.scope || "$current_scope" == *.slice ]]; then
     echo "Resetting unit '${current_scope}' AllowedCPUs=${ROOT_CPU_LIST}"
     sudo systemctl set-property --runtime "${current_scope}" AllowedCPUs="${ROOT_CPU_LIST}" || \
       echo "Warning: failed to reset unit '${current_scope}' (it may already be gone)." >&2
+  fi
+  if [[ "$service_unit" == *.service ]]; then
+    echo "Resetting ${service_unit} AllowedCPUs=${ROOT_CPU_LIST}"
+    sudo systemctl set-property --runtime "$service_unit" AllowedCPUs="${ROOT_CPU_LIST}" || \
+      echo "Warning: failed to reset unit '${service_unit}' (it may already be gone)." >&2
+    if [ -n "$isolated_cgroup_dir" ] && [ -d "$isolated_cgroup_dir" ]; then
+      if [ -z "$service_cgroup_dir" ] && [ -n "$service_unit" ]; then
+        svc_cg="$(systemctl show -p ControlGroup --value "$service_unit" 2>/dev/null || true)"
+        [ -n "$svc_cg" ] && service_cgroup_dir="${CPUSET_ROOT}${svc_cg}"
+      fi
+      if [ -n "$service_cgroup_dir" ] && [ -d "$service_cgroup_dir" ]; then
+        echo "Moving processes from isolated cgroup back to ${service_unit}"
+        sudo sh -c "while read -r pid; do \
+          [ -z \"\$pid\" ] && continue; \
+          echo \"\$pid\" > \"${service_cgroup_dir}/cgroup.procs\" 2>/dev/null || true; \
+        done < \"${isolated_cgroup_dir}/cgroup.procs\""
+      fi
+      echo "Removing isolated cgroup ${isolated_cgroup_dir}"
+      sudo rmdir "$isolated_cgroup_dir" 2>/dev/null || \
+        echo "Warning: could not remove ${isolated_cgroup_dir}" >&2
+    fi
   fi
   if [[ "$fallback_other_unit" == *.scope || "$fallback_other_unit" == *.service || "$fallback_other_unit" == *.slice ]]; then
     echo "Resetting fallback unit '${fallback_other_unit}' AllowedCPUs=${ROOT_CPU_LIST}"
