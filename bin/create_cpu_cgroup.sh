@@ -7,8 +7,8 @@
 #   ./create_cpu_cgroup.sh 0-16
 #
 # This script:
-# - creates /sys/fs/cgroup/cpuset/isolated and /sys/fs/cgroup/cpuset/other
-# - sets cpuset.cpus for isolated to <isolated-cpu-list> (cpu_exclusive=1)
+# - creates cpuset cgroups: isolated + other (cgroup v1 or v2)
+# - sets cpuset.cpus for isolated to <isolated-cpu-list>
 # - sets cpuset.cpus for other to the remaining CPUs
 # - copies cpuset.mems from the root cpuset
 # - moves all tasks from the root cpuset to "other"
@@ -27,18 +27,50 @@ OTHER_NAME="other"
 ISO_CPU_LIST="$1"
 
 CPUSET_ROOT="/sys/fs/cgroup/cpuset"
-ISO_DIR="${CPUSET_ROOT}/${ISO_NAME}"
-OTHER_DIR="${CPUSET_ROOT}/${OTHER_NAME}"
+CGROUP_MODE=""
+TASKS_FILE="tasks"
+ROOT_CPU_FILE="cpuset.cpus"
+ROOT_MEMS_FILE="cpuset.mems"
 
-if [ ! -d "$CPUSET_ROOT" ] || [ ! -f "${CPUSET_ROOT}/cpuset.cpus" ]; then
-  echo "Error: cpuset cgroup filesystem not found at ${CPUSET_ROOT}" >&2
-  echo "Make sure cgroup v1 cpuset is mounted (and you have permissions)." >&2
+if [ -f "/sys/fs/cgroup/cgroup.controllers" ]; then
+  CGROUP_MODE="v2"
+  CPUSET_ROOT="/sys/fs/cgroup"
+  TASKS_FILE="cgroup.procs"
+  ROOT_CPU_FILE="cpuset.cpus.effective"
+  ROOT_MEMS_FILE="cpuset.mems.effective"
+elif [ -d "$CPUSET_ROOT" ] && [ -f "${CPUSET_ROOT}/cpuset.cpus" ]; then
+  CGROUP_MODE="v1"
+else
+  echo "Error: cpuset cgroup filesystem not found." >&2
+  echo "Expected either cgroup v2 at /sys/fs/cgroup or v1 cpuset at /sys/fs/cgroup/cpuset." >&2
   exit 1
 fi
 
-if ! command -v cgcreate >/dev/null 2>&1; then
-  echo "Error: cgcreate not found. Install libcgroup tools (e.g. 'cgroup-tools' / 'libcgroup')." >&2
-  exit 1
+ISO_DIR="${CPUSET_ROOT}/${ISO_NAME}"
+OTHER_DIR="${CPUSET_ROOT}/${OTHER_NAME}"
+
+if [ "$CGROUP_MODE" = "v1" ]; then
+  if ! command -v cgcreate >/dev/null 2>&1; then
+    echo "Error: cgcreate not found. Install libcgroup tools (e.g. 'cgroup-tools' / 'libcgroup')." >&2
+    exit 1
+  fi
+else
+  root_controllers="$(cat "${CPUSET_ROOT}/cgroup.controllers")"
+  case " ${root_controllers} " in
+    *" cpuset "*) ;;
+    *)
+      echo "Error: cpuset controller is not available in cgroup v2 root." >&2
+      exit 1
+      ;;
+  esac
+  root_subtree="$(cat "${CPUSET_ROOT}/cgroup.subtree_control")"
+  case " ${root_subtree} " in
+    *" cpuset "*) ;;
+    *)
+      echo "Enabling cpuset controller in cgroup v2 root subtree_control"
+      echo "+cpuset" | sudo tee "${CPUSET_ROOT}/cgroup.subtree_control" >/dev/null
+      ;;
+  esac
 fi
 
 normalize_cpu_list() {
@@ -142,19 +174,23 @@ if [ -z "$ISO_CPU_LIST" ]; then
   exit 1
 fi
 
-ROOT_CPU_LIST="$(cat "${CPUSET_ROOT}/cpuset.cpus")"
+ROOT_CPU_LIST="$(cat "${CPUSET_ROOT}/${ROOT_CPU_FILE}")"
 OTHER_CPU_LIST="$(calc_other_cpu_list "$ROOT_CPU_LIST" "$ISO_CPU_LIST")"
 
 # cpuset requires mems + cpus to be set on the new cgroup before moving tasks.
 # Use the root cpuset mems as a default.
 if [ -d "$ISO_DIR" ]; then
-  if [ "$(sudo wc -l < "${ISO_DIR}/tasks")" -gt 0 ]; then
+  if [ "$(sudo wc -l < "${ISO_DIR}/${TASKS_FILE}")" -gt 0 ]; then
     echo "Error: '${ISO_NAME}' cgroup already has tasks; refusing to modify it." >&2
     exit 1
   fi
 else
-  echo "Creating cgroup '${ISO_NAME}' in cpuset controller"
-  sudo cgcreate -g "cpuset:${ISO_NAME}"
+  echo "Creating cgroup '${ISO_NAME}' in cpuset controller (${CGROUP_MODE})"
+  if [ "$CGROUP_MODE" = "v1" ]; then
+    sudo cgcreate -g "cpuset:${ISO_NAME}"
+  else
+    sudo mkdir -p "$ISO_DIR"
+  fi
 fi
 
 current_iso="$(sudo cat "${ISO_DIR}/cpuset.cpus")"
@@ -163,22 +199,30 @@ if [ "$current_iso_norm" != "$ISO_CPU_LIST" ]; then
   echo "Warning: '${ISO_NAME}' cpuset.cpus differs; updating to ${ISO_CPU_LIST}" >&2
 fi
 echo "Configuring ${ISO_NAME} cpuset.mems (copied from root cpuset)"
-cat "${CPUSET_ROOT}/cpuset.mems" | sudo tee "${ISO_DIR}/cpuset.mems" >/dev/null
+cat "${CPUSET_ROOT}/${ROOT_MEMS_FILE}" | sudo tee "${ISO_DIR}/cpuset.mems" >/dev/null
 echo "Configuring ${ISO_NAME} cpuset.cpus=${ISO_CPU_LIST}"
 echo "$ISO_CPU_LIST" | sudo tee "${ISO_DIR}/cpuset.cpus" >/dev/null
-echo "Configuring ${ISO_NAME} cpuset.cpu_exclusive=1"
-echo 1 | sudo tee "${ISO_DIR}/cpuset.cpu_exclusive" >/dev/null
+if [ "$CGROUP_MODE" = "v1" ]; then
+  echo "Configuring ${ISO_NAME} cpuset.cpu_exclusive=1"
+  echo 1 | sudo tee "${ISO_DIR}/cpuset.cpu_exclusive" >/dev/null
+fi
 
 if [ ! -d "$OTHER_DIR" ]; then
-  echo "Creating cgroup '${OTHER_NAME}' in cpuset controller"
-  sudo cgcreate -g "cpuset:${OTHER_NAME}"
+  echo "Creating cgroup '${OTHER_NAME}' in cpuset controller (${CGROUP_MODE})"
+  if [ "$CGROUP_MODE" = "v1" ]; then
+    sudo cgcreate -g "cpuset:${OTHER_NAME}"
+  else
+    sudo mkdir -p "$OTHER_DIR"
+  fi
 fi
 echo "Configuring ${OTHER_NAME} cpuset.mems (copied from root cpuset)"
-cat "${CPUSET_ROOT}/cpuset.mems" | sudo tee "${OTHER_DIR}/cpuset.mems" >/dev/null
+cat "${CPUSET_ROOT}/${ROOT_MEMS_FILE}" | sudo tee "${OTHER_DIR}/cpuset.mems" >/dev/null
 echo "Configuring ${OTHER_NAME} cpuset.cpus=${OTHER_CPU_LIST}"
 echo "$OTHER_CPU_LIST" | sudo tee "${OTHER_DIR}/cpuset.cpus" >/dev/null
-echo "Configuring ${OTHER_NAME} cpuset.cpu_exclusive=0"
-echo 0 | sudo tee "${OTHER_DIR}/cpuset.cpu_exclusive" >/dev/null
+if [ "$CGROUP_MODE" = "v1" ]; then
+  echo "Configuring ${OTHER_NAME} cpuset.cpu_exclusive=0"
+  echo 0 | sudo tee "${OTHER_DIR}/cpuset.cpu_exclusive" >/dev/null
+fi
 
 echo "Moving tasks from root cpuset to '${OTHER_NAME}'"
 sudo sh -c "while read -r pid; do \
@@ -186,12 +230,12 @@ sudo sh -c "while read -r pid; do \
   if [ ! -r \"/proc/\$pid/cmdline\" ] || [ ! -s \"/proc/\$pid/cmdline\" ]; then \
     continue; \
   fi; \
-  if ! echo \"\$pid\" > \"${OTHER_DIR}/tasks\" 2>/dev/null; then \
+  if ! echo \"\$pid\" > \"${OTHER_DIR}/${TASKS_FILE}\" 2>/dev/null; then \
     echo \"Warning: failed to move pid \$pid\" >&2; \
   fi; \
-done < \"${CPUSET_ROOT}/tasks\""
+done < \"${CPUSET_ROOT}/${TASKS_FILE}\""
 
 echo
 echo "Moving parent shell into '${ISO_NAME}'"
-echo "$PPID" | sudo tee "${ISO_DIR}/tasks" >/dev/null
+echo "$PPID" | sudo tee "${ISO_DIR}/${TASKS_FILE}" >/dev/null
 
