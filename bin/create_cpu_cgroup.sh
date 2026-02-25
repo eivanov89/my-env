@@ -1,18 +1,16 @@
 #!/bin/bash
 
-# Create and configure cpuset cgroups: isolated + other.
+# Create and configure CPU isolation for cpuset controller.
 # Usage: ./create_cpu_cgroup.sh <isolated-cpu-list>
 #
 # Example:
 #   ./create_cpu_cgroup.sh 0-16
 #
-# This script:
-# - creates cpuset cgroups: isolated + other (cgroup v1 or v2)
-# - sets cpuset.cpus for isolated to <isolated-cpu-list>
-# - sets cpuset.cpus for other to the remaining CPUs
-# - copies cpuset.mems from the root cpuset
-# - moves all tasks from the root cpuset to "other"
-# - prints the command to attach current shell to "isolated"
+# Behavior:
+# - cgroup v1: creates cpuset cgroups "isolated" + "other", then moves tasks.
+# - cgroup v2: uses systemd AllowedCPUs at runtime:
+#   - user.slice -> remaining CPUs ("other")
+#   - current session scope -> isolated CPUs
 
 set -euo pipefail
 
@@ -25,6 +23,7 @@ fi
 ISO_NAME="isolated"
 OTHER_NAME="other"
 ISO_CPU_LIST="$1"
+STATE_FILE="/tmp/create_cpu_cgroup_state_${UID}.env"
 
 CPUSET_ROOT="/sys/fs/cgroup/cpuset"
 CGROUP_MODE=""
@@ -55,6 +54,10 @@ if [ "$CGROUP_MODE" = "v1" ]; then
     exit 1
   fi
 else
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "Error: systemctl not found; required for cgroup v2 runtime CPU partitioning." >&2
+    exit 1
+  fi
   root_controllers="$(cat "${CPUSET_ROOT}/cgroup.controllers")"
   case " ${root_controllers} " in
     *" cpuset "*) ;;
@@ -168,6 +171,71 @@ print(fmt(other))
 PY
 }
 
+detect_systemd_unit_for_pid() {
+  local pid="$1"
+  local unit=""
+  local cgroup_path=""
+  local segment=""
+
+  if command -v ps >/dev/null 2>&1; then
+    unit="$(ps -o unit= -p "$pid" 2>/dev/null | awk '{print $1}')"
+    case "$unit" in
+      ""|"-"|"?"|"N/A"|"n/a") unit="" ;;
+    esac
+    if [ -n "$unit" ]; then
+      echo "$unit"
+      return 0
+    fi
+  fi
+
+  cgroup_path="$(awk -F: '$1=="0"{print $3}' "/proc/${pid}/cgroup" 2>/dev/null || true)"
+  for segment in ${cgroup_path//\// }; do
+    case "$segment" in
+      *.scope|*.service|*.slice) unit="$segment" ;;
+    esac
+  done
+  if [ -n "$unit" ]; then
+    echo "$unit"
+    return 0
+  fi
+
+  if command -v loginctl >/dev/null 2>&1 && [ -n "${XDG_SESSION_ID:-}" ]; then
+    unit="$(loginctl show-session "${XDG_SESSION_ID}" -p Scope --value 2>/dev/null || true)"
+    if [[ "$unit" == *.scope ]]; then
+      echo "$unit"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+detect_ancestor_systemd_unit() {
+  local pid="$1"
+  local unit=""
+  local next_ppid=""
+  local guard=0
+
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+    unit="$(detect_systemd_unit_for_pid "$pid" || true)"
+    if [ -n "$unit" ]; then
+      echo "$unit"
+      return 0
+    fi
+    next_ppid="$(awk '{print $4}' "/proc/${pid}/stat" 2>/dev/null || true)"
+    if [ -z "$next_ppid" ] || [ "$next_ppid" -eq "$pid" ] 2>/dev/null; then
+      break
+    fi
+    pid="$next_ppid"
+    guard=$((guard + 1))
+    if [ "$guard" -gt 64 ]; then
+      break
+    fi
+  done
+
+  return 1
+}
+
 ISO_CPU_LIST="$(normalize_cpu_list "$ISO_CPU_LIST")"
 if [ -z "$ISO_CPU_LIST" ]; then
   echo "Error: isolated CPU list is empty after normalization" >&2
@@ -177,8 +245,55 @@ fi
 ROOT_CPU_LIST="$(cat "${CPUSET_ROOT}/${ROOT_CPU_FILE}")"
 OTHER_CPU_LIST="$(calc_other_cpu_list "$ROOT_CPU_LIST" "$ISO_CPU_LIST")"
 
-# cpuset requires mems + cpus to be set on the new cgroup before moving tasks.
-# Use the root cpuset mems as a default.
+if [ "$CGROUP_MODE" = "v2" ]; then
+  fallback_taskset_pid=""
+  fallback_other_unit=""
+  echo "Applying runtime CPU partition via systemd (cgroup v2)"
+  echo "Setting user.slice AllowedCPUs=${OTHER_CPU_LIST}"
+  sudo systemctl set-property --runtime user.slice AllowedCPUs="${OTHER_CPU_LIST}"
+
+  current_unit="$(detect_systemd_unit_for_pid "${PPID}" || true)"
+
+  echo
+  if [ -n "$current_unit" ]; then
+    echo "Setting current unit '${current_unit}' AllowedCPUs=${ISO_CPU_LIST}"
+    sudo systemctl set-property --runtime "${current_unit}" AllowedCPUs="${ISO_CPU_LIST}"
+    echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+  else
+    fallback_other_unit="$(detect_ancestor_systemd_unit "${PPID}" || true)"
+    if [ -n "$fallback_other_unit" ]; then
+      echo "Current shell has no direct unit; setting ancestor unit '${fallback_other_unit}' AllowedCPUs=${OTHER_CPU_LIST}"
+      sudo systemctl set-property --runtime "${fallback_other_unit}" AllowedCPUs="${OTHER_CPU_LIST}"
+    else
+      echo "Warning: unable to detect any ancestor systemd unit for current shell tree." >&2
+    fi
+
+    if command -v taskset >/dev/null 2>&1; then
+      echo "Pinning current shell PID ${PPID} to ${ISO_CPU_LIST} via taskset fallback"
+      taskset -pc "${ISO_CPU_LIST}" "${PPID}" >/dev/null
+      fallback_taskset_pid="${PPID}"
+      echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+    else
+      echo "Warning: taskset not found. Run an isolated shell with:" >&2
+      echo "  systemd-run --scope -p AllowedCPUs=${ISO_CPU_LIST} --same-dir bash"
+    fi
+  fi
+
+  {
+    echo "CGROUP_MODE=${CGROUP_MODE}"
+    echo "ISO_CPU_LIST=${ISO_CPU_LIST}"
+    echo "OTHER_CPU_LIST=${OTHER_CPU_LIST}"
+    echo "ROOT_CPU_LIST=${ROOT_CPU_LIST}"
+    echo "CURRENT_UNIT=${current_unit}"
+    echo "FALLBACK_OTHER_UNIT=${fallback_other_unit}"
+    echo "FALLBACK_TASKSET_PID=${fallback_taskset_pid}"
+  } > "${STATE_FILE}"
+  echo
+  echo "Saved runtime state to ${STATE_FILE}"
+  exit 0
+fi
+
+# cgroup v1 path: cpuset requires mems + cpus to be set before moving tasks.
 if [ -d "$ISO_DIR" ]; then
   if [ "$(sudo wc -l < "${ISO_DIR}/${TASKS_FILE}")" -gt 0 ]; then
     echo "Error: '${ISO_NAME}' cgroup already has tasks; refusing to modify it." >&2
@@ -186,11 +301,7 @@ if [ -d "$ISO_DIR" ]; then
   fi
 else
   echo "Creating cgroup '${ISO_NAME}' in cpuset controller (${CGROUP_MODE})"
-  if [ "$CGROUP_MODE" = "v1" ]; then
-    sudo cgcreate -g "cpuset:${ISO_NAME}"
-  else
-    sudo mkdir -p "$ISO_DIR"
-  fi
+  sudo cgcreate -g "cpuset:${ISO_NAME}"
 fi
 
 current_iso="$(sudo cat "${ISO_DIR}/cpuset.cpus")"
@@ -202,27 +313,19 @@ echo "Configuring ${ISO_NAME} cpuset.mems (copied from root cpuset)"
 cat "${CPUSET_ROOT}/${ROOT_MEMS_FILE}" | sudo tee "${ISO_DIR}/cpuset.mems" >/dev/null
 echo "Configuring ${ISO_NAME} cpuset.cpus=${ISO_CPU_LIST}"
 echo "$ISO_CPU_LIST" | sudo tee "${ISO_DIR}/cpuset.cpus" >/dev/null
-if [ "$CGROUP_MODE" = "v1" ]; then
-  echo "Configuring ${ISO_NAME} cpuset.cpu_exclusive=1"
-  echo 1 | sudo tee "${ISO_DIR}/cpuset.cpu_exclusive" >/dev/null
-fi
+echo "Configuring ${ISO_NAME} cpuset.cpu_exclusive=1"
+echo 1 | sudo tee "${ISO_DIR}/cpuset.cpu_exclusive" >/dev/null
 
 if [ ! -d "$OTHER_DIR" ]; then
   echo "Creating cgroup '${OTHER_NAME}' in cpuset controller (${CGROUP_MODE})"
-  if [ "$CGROUP_MODE" = "v1" ]; then
-    sudo cgcreate -g "cpuset:${OTHER_NAME}"
-  else
-    sudo mkdir -p "$OTHER_DIR"
-  fi
+  sudo cgcreate -g "cpuset:${OTHER_NAME}"
 fi
 echo "Configuring ${OTHER_NAME} cpuset.mems (copied from root cpuset)"
 cat "${CPUSET_ROOT}/${ROOT_MEMS_FILE}" | sudo tee "${OTHER_DIR}/cpuset.mems" >/dev/null
 echo "Configuring ${OTHER_NAME} cpuset.cpus=${OTHER_CPU_LIST}"
 echo "$OTHER_CPU_LIST" | sudo tee "${OTHER_DIR}/cpuset.cpus" >/dev/null
-if [ "$CGROUP_MODE" = "v1" ]; then
-  echo "Configuring ${OTHER_NAME} cpuset.cpu_exclusive=0"
-  echo 0 | sudo tee "${OTHER_DIR}/cpuset.cpu_exclusive" >/dev/null
-fi
+echo "Configuring ${OTHER_NAME} cpuset.cpu_exclusive=0"
+echo 0 | sudo tee "${OTHER_DIR}/cpuset.cpu_exclusive" >/dev/null
 
 echo "Moving tasks from root cpuset to '${OTHER_NAME}'"
 sudo sh -c "while read -r pid; do \
