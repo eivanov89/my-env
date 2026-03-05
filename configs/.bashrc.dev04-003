@@ -1,0 +1,46 @@
+# Ignore sensitive disk commands in shell history.
+HISTIGNORE="${HISTIGNORE:+$HISTIGNORE:}*nvme0n1*:*nvme1n1*:nvme *:blkdiscard *:blkdiskard *"
+
+_confirm_sensitive_disk_command() {
+    local tool="$1"
+    shift
+
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == *nvme0n1* || "$arg" == *nvme1n1* || "$arg" == *"/dev/nvme"* ]]; then
+            read -r -p "[SAFETY] ${tool} references ${arg}. Continue? [y/N] " _ans
+            [[ "$_ans" =~ ^[Yy]$ ]] || return 1
+            command "$tool" "$@"
+            return $?
+        fi
+    done
+
+    read -r -p "[SAFETY] Run ${tool} with args: $* ? [y/N] " _ans
+    [[ "$_ans" =~ ^[Yy]$ ]] || return 1
+    command "$tool" "$@"
+}
+
+blkdiscard() {
+    _confirm_sensitive_disk_command blkdiscard "$@"
+}
+
+# Keep typo-compatible wrapper in case this name is used in your shell.
+blkdiskard() {
+    _confirm_sensitive_disk_command blkdiscard "$@"
+}
+
+nvme() {
+    _confirm_sensitive_disk_command nvme "$@"
+}
+
+dd() {
+    _confirm_sensitive_disk_command dd "$@"
+}
+
+parted() {
+    _confirm_sensitive_disk_command parted "$@"
+}
+
+fdisk() {
+    _confirm_sensitive_disk_command fdisk "$@"
+}

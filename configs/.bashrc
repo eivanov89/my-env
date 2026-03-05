@@ -71,6 +71,8 @@ alias vi='vim -p'
 alias mkdt='date +%Y%m%d_%H%M'
 alias mkts=mkdt
 
+alias mylog='git log --author eivanov89'
+
 ulimit -c unlimited
 umask 022 # all to me, read to group and others
 
