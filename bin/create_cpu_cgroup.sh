@@ -1,28 +1,71 @@
 #!/bin/bash
 
 # Create and configure CPU isolation for cpuset controller.
-# Usage: ./create_cpu_cgroup.sh <isolated-cpu-list>
+# Usage: ./create_cpu_cgroup.sh [--numa-node N] <isolated-cpu-list>
 #
 # Example:
 #   ./create_cpu_cgroup.sh 0-16
+#   ./create_cpu_cgroup.sh --numa-node 1 0-16
+#
+# Options:
+#   --numa-node N   Bind isolated group to NUMA node N (default: 0).
+#                   Sets cpuset.mems (v1) or AllowedMemoryNodes (v2).
 #
 # Behavior:
 # - cgroup v1: creates cpuset cgroups "isolated" + "other", then moves tasks.
-# - cgroup v2: uses systemd AllowedCPUs at runtime:
+# - cgroup v2: uses systemd AllowedCPUs/AllowedMemoryNodes at runtime:
 #   - user.slice -> remaining CPUs ("other")
-#   - current session scope -> isolated CPUs
+#   - current session scope -> isolated CPUs + specified NUMA node
 
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <isolated-cpu-list>" >&2
-  echo "Example: $0 0-16" >&2
+NUMA_NODE=0
+ISO_CPU_LIST=""
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --numa-node)
+      NUMA_NODE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--numa-node N] <isolated-cpu-list>"
+      echo "Example: $0 0-16"
+      echo "         $0 --numa-node 1 0-16"
+      echo
+      echo "Options:"
+      echo "  --numa-node N   Bind isolated group to NUMA node N (default: 0)"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      echo "Usage: $0 [--numa-node N] <isolated-cpu-list>" >&2
+      exit 1
+      ;;
+    *)
+      if [ -n "$ISO_CPU_LIST" ]; then
+        echo "Error: unexpected argument: $1" >&2
+        exit 1
+      fi
+      ISO_CPU_LIST="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$ISO_CPU_LIST" ]; then
+  echo "Error: <isolated-cpu-list> is required" >&2
+  echo "Usage: $0 [--numa-node N] <isolated-cpu-list>" >&2
+  exit 1
+fi
+
+if ! [[ "$NUMA_NODE" =~ ^[0-9]+$ ]]; then
+  echo "Error: --numa-node must be a non-negative integer, got: ${NUMA_NODE}" >&2
   exit 1
 fi
 
 ISO_NAME="isolated"
 OTHER_NAME="other"
-ISO_CPU_LIST="$1"
 STATE_FILE="/tmp/create_cpu_cgroup_state_${UID}.env"
 
 CPUSET_ROOT="/sys/fs/cgroup/cpuset"
@@ -42,6 +85,12 @@ elif [ -d "$CPUSET_ROOT" ] && [ -f "${CPUSET_ROOT}/cpuset.cpus" ]; then
 else
   echo "Error: cpuset cgroup filesystem not found." >&2
   echo "Expected either cgroup v2 at /sys/fs/cgroup or v1 cpuset at /sys/fs/cgroup/cpuset." >&2
+  exit 1
+fi
+
+NUMA_SYSFS="/sys/devices/system/node/node${NUMA_NODE}"
+if [ ! -d "$NUMA_SYSFS" ]; then
+  echo "Error: NUMA node ${NUMA_NODE} not found (${NUMA_SYSFS} does not exist)." >&2
   exit 1
 fi
 
@@ -259,9 +308,9 @@ if [ "$CGROUP_MODE" = "v2" ]; then
 
   echo
   if [[ "$current_unit" == *.scope ]]; then
-    echo "Setting current unit '${current_unit}' AllowedCPUs=${ISO_CPU_LIST}"
-    sudo systemctl set-property --runtime "${current_unit}" AllowedCPUs="${ISO_CPU_LIST}"
-    echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+    echo "Setting current unit '${current_unit}' AllowedCPUs=${ISO_CPU_LIST} AllowedMemoryNodes=${NUMA_NODE}"
+    sudo systemctl set-property --runtime "${current_unit}" AllowedCPUs="${ISO_CPU_LIST}" AllowedMemoryNodes="${NUMA_NODE}"
+    echo "Current shell session is now constrained to CPUs ${ISO_CPU_LIST}, NUMA node ${NUMA_NODE}"
   elif [[ "$current_unit" == *.service ]]; then
     # System-wide services (e.g. ssh.service) contain unrelated processes.
     # Move PPID into a new peer cgroup, then constrain the service to OTHER CPUs.
@@ -286,6 +335,7 @@ if [ "$CGROUP_MODE" = "v2" ]; then
       echo "Creating isolated cgroup ${isolated_cgroup_dir}"
       sudo mkdir -p "$isolated_cgroup_dir"
       echo "$ISO_CPU_LIST" | sudo tee "${isolated_cgroup_dir}/cpuset.cpus" >/dev/null
+      echo "$NUMA_NODE" | sudo tee "${isolated_cgroup_dir}/cpuset.mems" >/dev/null
 
       echo "Moving shell PID ${PPID} into isolated cgroup"
       echo "$PPID" | sudo tee "${isolated_cgroup_dir}/cgroup.procs" >/dev/null
@@ -293,7 +343,7 @@ if [ "$CGROUP_MODE" = "v2" ]; then
       echo "Setting ${service_unit} AllowedCPUs=${OTHER_CPU_LIST}"
       sudo systemctl set-property --runtime "$service_unit" AllowedCPUs="${OTHER_CPU_LIST}"
 
-      echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+      echo "Current shell session is now constrained to CPUs ${ISO_CPU_LIST}, NUMA node ${NUMA_NODE}"
     else
       echo "Warning: could not determine ControlGroup for ${service_unit}; falling back to taskset." >&2
       service_unit=""
@@ -332,6 +382,7 @@ if [ "$CGROUP_MODE" = "v2" ]; then
 
   {
     echo "CGROUP_MODE=${CGROUP_MODE}"
+    echo "NUMA_NODE=${NUMA_NODE}"
     echo "ISO_CPU_LIST=${ISO_CPU_LIST}"
     echo "OTHER_CPU_LIST=${OTHER_CPU_LIST}"
     echo "ROOT_CPU_LIST=${ROOT_CPU_LIST}"
@@ -363,8 +414,8 @@ current_iso_norm="$(normalize_cpu_list "$current_iso")"
 if [ "$current_iso_norm" != "$ISO_CPU_LIST" ]; then
   echo "Warning: '${ISO_NAME}' cpuset.cpus differs; updating to ${ISO_CPU_LIST}" >&2
 fi
-echo "Configuring ${ISO_NAME} cpuset.mems (copied from root cpuset)"
-cat "${CPUSET_ROOT}/${ROOT_MEMS_FILE}" | sudo tee "${ISO_DIR}/cpuset.mems" >/dev/null
+echo "Configuring ${ISO_NAME} cpuset.mems=${NUMA_NODE}"
+echo "$NUMA_NODE" | sudo tee "${ISO_DIR}/cpuset.mems" >/dev/null
 echo "Configuring ${ISO_NAME} cpuset.cpus=${ISO_CPU_LIST}"
 echo "$ISO_CPU_LIST" | sudo tee "${ISO_DIR}/cpuset.cpus" >/dev/null
 echo "Configuring ${ISO_NAME} cpuset.cpu_exclusive=1"
