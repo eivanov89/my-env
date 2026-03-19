@@ -7,3 +7,5 @@
 	st = status
 	lg = log --oneline --graph --decorate
 	br = branch
+[core]
+	excludesfile = /home/eivanov89/repos/my-env/configs/.gitignore_global

@@ -2,6 +2,8 @@
 
 set -e
 
+pushd $HOME/repos/ydb_main
+
 check_status() {
     if [ $? -eq 0 ]; then
         echo "✓ $1 completed successfully"
@@ -34,3 +36,5 @@ echo "5. Force pushing to origin/main..."
 git push origin main --force
 
 echo "=== YDB hard sync completed successfully ==="
+
+popd
