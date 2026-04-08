@@ -285,6 +285,76 @@ detect_ancestor_systemd_unit() {
   return 1
 }
 
+# cgroup v2: relative path under CPUSET_ROOT (/sys/fs/cgroup), e.g. /system.slice/foo.scope
+cgroup_v2_rel_path_for_pid() {
+  local pid="$1"
+  local line=""
+  line="$(grep '^0::' "/proc/${pid}/cgroup" 2>/dev/null | head -1 || true)"
+  if [ -z "$line" ]; then
+    return 1
+  fi
+  echo "${line#0::}"
+}
+
+cgroup_abs_path_v2_for_pid() {
+  local pid="$1"
+  local rel=""
+  rel="$(cgroup_v2_rel_path_for_pid "$pid" || true)"
+  if [ -z "$rel" ]; then
+    return 1
+  fi
+  echo "${CPUSET_ROOT}${rel}"
+}
+
+# Delegate a leaf cgroup to the invoking user so they can write PIDs to cgroup.procs (or tasks) without sudo.
+delegate_cgroup_to_invoking_user() {
+  local dir="$1"
+  local uid="${SUDO_UID:-$(id -u)}"
+  local gid="${SUDO_GID:-$(id -g)}"
+  if [ ! -d "$dir" ]; then
+    return 1
+  fi
+  sudo chown -R "${uid}:${gid}" "$dir"
+  # Ensure tasks interface is writable (some setups leave mode tight after chown).
+  if [ -e "${dir}/cgroup.procs" ]; then
+    sudo chmod u+w "${dir}/cgroup.procs" 2>/dev/null || true
+  fi
+  if [ -e "${dir}/tasks" ]; then
+    sudo chmod u+w "${dir}/tasks" 2>/dev/null || true
+  fi
+}
+
+# Print human-readable cgroup location (name, dir, how to move a PID).
+print_cgroup_paths_for_dir() {
+  local dir="$1"
+  local tasks_basename="${2:-cgroup.procs}"
+  local name=""
+  local procs="${dir}/${tasks_basename}"
+  name="$(basename "$dir")"
+  echo "Cgroup name: ${name}"
+  echo "Cgroup path: ${dir}"
+  echo "Tasks file: ${procs}"
+  echo
+  echo "Moving a process from another cgroup (e.g. ssh.service) requires permission to"
+  echo "detach it from the *source* cgroup, not just write access here. Typical fixes:"
+  echo "  sudo sh -c 'echo PID > ${procs}'"
+  echo "  # or: echo PID | sudo tee ${procs} >/dev/null"
+  echo "If your shell was already moved into this cgroup by this script, children inherit it;"
+  echo "use > not >> (append is not supported on cgroup.procs)."
+  printf '  echo $$ > %s\n' "${procs}"
+}
+
+print_cgroup_paths_for_pid_v2() {
+  local pid="${1:-$$}"
+  local dir=""
+  dir="$(cgroup_abs_path_v2_for_pid "$pid" || true)"
+  if [ -z "$dir" ]; then
+    echo "Warning: could not resolve cgroup v2 path for PID ${pid} (/proc/${pid}/cgroup has no 0:: line)." >&2
+    return 1
+  fi
+  print_cgroup_paths_for_dir "$dir" "cgroup.procs"
+}
+
 ISO_CPU_LIST="$(normalize_cpu_list "$ISO_CPU_LIST")"
 if [ -z "$ISO_CPU_LIST" ]; then
   echo "Error: isolated CPU list is empty after normalization" >&2
@@ -311,6 +381,9 @@ if [ "$CGROUP_MODE" = "v2" ]; then
     echo "Setting current unit '${current_unit}' AllowedCPUs=${ISO_CPU_LIST} AllowedMemoryNodes=${NUMA_NODE}"
     sudo systemctl set-property --runtime "${current_unit}" AllowedCPUs="${ISO_CPU_LIST}" AllowedMemoryNodes="${NUMA_NODE}"
     echo "Current shell session is now constrained to CPUs ${ISO_CPU_LIST}, NUMA node ${NUMA_NODE}"
+    echo
+    echo "Shell cgroup (session scope):"
+    print_cgroup_paths_for_pid_v2 "${PPID}" || true
   elif [[ "$current_unit" == *.service ]]; then
     # System-wide services (e.g. ssh.service) contain unrelated processes.
     # Move PPID into a new peer cgroup, then constrain the service to OTHER CPUs.
@@ -343,7 +416,12 @@ if [ "$CGROUP_MODE" = "v2" ]; then
       echo "Setting ${service_unit} AllowedCPUs=${OTHER_CPU_LIST}"
       sudo systemctl set-property --runtime "$service_unit" AllowedCPUs="${OTHER_CPU_LIST}"
 
+      echo "Delegating isolated cgroup to invoking user (chown for cgroup.procs)"
+      delegate_cgroup_to_invoking_user "$isolated_cgroup_dir"
+
       echo "Current shell session is now constrained to CPUs ${ISO_CPU_LIST}, NUMA node ${NUMA_NODE}"
+      echo
+      print_cgroup_paths_for_dir "$isolated_cgroup_dir" "cgroup.procs"
     else
       echo "Warning: could not determine ControlGroup for ${service_unit}; falling back to taskset." >&2
       service_unit=""
@@ -374,6 +452,9 @@ if [ "$CGROUP_MODE" = "v2" ]; then
       taskset -pc "${ISO_CPU_LIST}" "${PPID}" >/dev/null
       fallback_taskset_pid="${PPID}"
       echo "Current shell session is now constrained to ${ISO_CPU_LIST}"
+      echo
+      echo "Shell cgroup (taskset only; use cgroup below to attach other processes if writable):"
+      print_cgroup_paths_for_pid_v2 "${PPID}" || true
     else
       echo "Warning: taskset not found. Run an isolated shell with:" >&2
       echo "  systemd-run --scope -p AllowedCPUs=${ISO_CPU_LIST} --same-dir bash"
@@ -389,6 +470,11 @@ if [ "$CGROUP_MODE" = "v2" ]; then
     echo "CURRENT_UNIT=${current_unit}"
     echo "SERVICE_UNIT=${service_unit}"
     echo "ISOLATED_CGROUP_DIR=${isolated_cgroup_dir}"
+    if [ -n "${isolated_cgroup_dir}" ]; then
+      echo "ISOLATED_CGROUP_TASKS_FILE=${isolated_cgroup_dir}/cgroup.procs"
+    else
+      echo "ISOLATED_CGROUP_TASKS_FILE="
+    fi
     echo "SERVICE_CGROUP_DIR=${service_cgroup_dir}"
     echo "FALLBACK_OTHER_UNIT=${fallback_other_unit}"
     echo "FALLBACK_TASKSET_PID=${fallback_taskset_pid}"
@@ -447,3 +533,7 @@ echo
 echo "Moving parent shell into '${ISO_NAME}'"
 echo "$PPID" | sudo tee "${ISO_DIR}/${TASKS_FILE}" >/dev/null
 
+echo "Delegating '${ISO_NAME}' cgroup to invoking user (chown for ${TASKS_FILE})"
+delegate_cgroup_to_invoking_user "$ISO_DIR"
+echo
+print_cgroup_paths_for_dir "$ISO_DIR" "${TASKS_FILE}"
