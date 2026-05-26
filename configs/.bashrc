@@ -4,6 +4,9 @@ CONFIGS_DIR=$REPOS_DIR/my-env/configs
 CUSTOM_BIN_DIRS=(~/.local/bin ~/bin ~/.jenv/bin $REPOS_DIR/my-env/bin)
 CONFIG_FILES=(~/.bashrc.local $CONFIGS_DIR/.bashrc.ydb ~/junk/my_configs/.bashrc.yandex ~/.cargo/env)
 
+# Stable SSH agent socket path
+SSH_AUTH_SOCK_LINK="$HOME/.ssh/ssh_auth_sock"
+
 export TZ=Europe/Belgrade
 export LC_ALL=en_US.UTF-8
 export LANG=
@@ -76,10 +79,21 @@ alias mylog='git log --author eivanov89'
 ulimit -c unlimited
 umask 022 # all to me, read to group and others
 
-if [[ -S "$SSH_AUTH_SOCK" && ! -h "$SSH_AUTH_SOCK" ]]; then
-        ln -sf "$SSH_AUTH_SOCK" ~/.ssh/ssh_auth_sock;
+if [[ -n "$TMUX" ]]; then
+    # Inside tmux: prefer the socket from tmux's current environment
+    tmux_sock="$(tmux show-environment SSH_AUTH_SOCK 2>/dev/null | sed 's/^SSH_AUTH_SOCK=//')"
+
+    if [[ -n "$tmux_sock" && -S "$tmux_sock" ]]; then
+        ln -sfn "$tmux_sock" "$SSH_AUTH_SOCK_LINK"
+    fi
+else
+    # Outside tmux: use the real SSH-forwarded socket from sshd
+    if [[ -n "$SSH_AUTH_SOCK" && -S "$SSH_AUTH_SOCK" && ! -L "$SSH_AUTH_SOCK" ]]; then
+        ln -sfn "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK_LINK"
+    fi
 fi
-export SSH_AUTH_SOCK=~/.ssh/ssh_auth_sock;
+
+export SSH_AUTH_SOCK="$SSH_AUTH_SOCK_LINK"
 
 for source_file in "${CONFIG_FILES[@]}"; do
     if [[ -e "$source_file" ]]; then
