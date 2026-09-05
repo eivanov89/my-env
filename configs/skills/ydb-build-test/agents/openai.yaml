@@ -1,0 +1,4 @@
+interface:
+  display_name: "YDB Build and Test"
+  short_description: "Build YDB targets and run YDB tests"
+  default_prompt: "Use $ydb-build-test to build the requested YDB targets and run the relevant tests."
