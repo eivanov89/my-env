@@ -6,7 +6,8 @@ fi
 
 export BUILD_CORES="${BUILD_CORES:-$(nproc --ignore=2)}"
 
-alias cds='cd ~/repos/ydb/ydb'
+alias cds='cd ~/repos/ydb'
+alias cdm='cd ~/repos/ydb_main'
 
 function ymake_impl() {
     profile=$1
