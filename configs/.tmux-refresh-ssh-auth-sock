@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+auth_sock="${1:-}"
+auth_sock_link="$HOME/.ssh/ssh_auth_sock"
+
+if [[ -n "$auth_sock" && "$auth_sock" != "$auth_sock_link" && -S "$auth_sock" ]]; then
+    ln -sfn -- "$auth_sock" "$auth_sock_link"
+fi
