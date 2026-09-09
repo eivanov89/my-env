@@ -157,6 +157,9 @@ function __list_entry_names() {
     return "$status"
 }
 
+# Remove inherited aliases so they do not shadow these functions.
+unalias l la 2>/dev/null
+
 function l() {
     __list_entry_names 0 0 "$@"
 }
