@@ -5,18 +5,18 @@ _confirm_sensitive_disk_command() {
     local tool="$1"
     shift
 
-    local arg
+    local answer arg
     for arg in "$@"; do
         if [[ "$arg" == *nvme0n1* || "$arg" == *nvme1n1* || "$arg" == *"/dev/nvme"* ]]; then
-            read -r -p "[SAFETY] ${tool} references ${arg}. Continue? [y/N] " _ans
-            [[ "$_ans" =~ ^[Yy]$ ]] || return 1
+            read -r -p "[SAFETY] ${tool} references ${arg}. Continue? [y/N] " answer
+            [[ "$answer" =~ ^[Yy]$ ]] || return 1
             command "$tool" "$@"
-            return $?
+            return
         fi
     done
 
-    read -r -p "[SAFETY] Run ${tool} with args: $* ? [y/N] " _ans
-    [[ "$_ans" =~ ^[Yy]$ ]] || return 1
+    read -r -p "[SAFETY] Run ${tool} with args: $* ? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
     command "$tool" "$@"
 }
 
