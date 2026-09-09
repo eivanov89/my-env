@@ -7,6 +7,28 @@ CONFIG_FILES=(~/.bashrc.local $CONFIGS_DIR/.bashrc.ydb ~/junk/my_configs/.bashrc
 # Stable SSH agent socket path
 SSH_AUTH_SOCK_LINK="$HOME/.ssh/ssh_auth_sock"
 
+function __refresh_ssh_auth_sock() {
+    local auth_sock="${SSH_AUTH_SOCK:-}"
+    local tmux_env
+
+    if [[ -n "$TMUX" ]]; then
+        if tmux_env="$(tmux show-environment SSH_AUTH_SOCK 2>/dev/null)"; then
+            if [[ "$tmux_env" == SSH_AUTH_SOCK=* ]]; then
+                auth_sock="${tmux_env#SSH_AUTH_SOCK=}"
+            fi
+        fi
+    fi
+
+    # Do not replace the stable link with a link to itself.
+    if [[ "$auth_sock" != "$SSH_AUTH_SOCK_LINK" && -S "$auth_sock" ]]; then
+        ln -sfn "$auth_sock" "$SSH_AUTH_SOCK_LINK"
+    fi
+
+    if [[ -S "$SSH_AUTH_SOCK_LINK" ]]; then
+        export SSH_AUTH_SOCK="$SSH_AUTH_SOCK_LINK"
+    fi
+}
+
 export TZ=Europe/Belgrade
 export LC_ALL=en_US.UTF-8
 export LANG=
@@ -14,6 +36,8 @@ export LANG=
 export PROMPT_COMMAND=__prompt_command
 function __prompt_command() {
     local EXIT="$?"             # This needs to be first
+
+    __refresh_ssh_auth_sock
 
     #local RCol='\[\e[0m\]'
     local RCol='\[\033[00m\]'
@@ -79,21 +103,7 @@ alias mylog='git log --author eivanov89'
 ulimit -c unlimited
 umask 022 # all to me, read to group and others
 
-if [[ -n "$TMUX" ]]; then
-    # Inside tmux: prefer the socket from tmux's current environment
-    tmux_sock="$(tmux show-environment SSH_AUTH_SOCK 2>/dev/null | sed 's/^SSH_AUTH_SOCK=//')"
-
-    if [[ -n "$tmux_sock" && -S "$tmux_sock" ]]; then
-        ln -sfn "$tmux_sock" "$SSH_AUTH_SOCK_LINK"
-    fi
-else
-    # Outside tmux: use the real SSH-forwarded socket from sshd
-    if [[ -n "$SSH_AUTH_SOCK" && -S "$SSH_AUTH_SOCK" && ! -L "$SSH_AUTH_SOCK" ]]; then
-        ln -sfn "$SSH_AUTH_SOCK" "$SSH_AUTH_SOCK_LINK"
-    fi
-fi
-
-export SSH_AUTH_SOCK="$SSH_AUTH_SOCK_LINK"
+__refresh_ssh_auth_sock
 
 for source_file in "${CONFIG_FILES[@]}"; do
     if [[ -e "$source_file" ]]; then

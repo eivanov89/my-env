@@ -32,15 +32,23 @@ ya make -j100 --build=release -DCFLAGS=-fno-omit-frame-pointer ...
 - Debug and sanitizer builds are exceptions to the default release build, but
   they must still use `-j100`.
 
-The user has pre-authorized commands that start with any of these forms. Run
-them without asking for separate permission unless the execution environment
-itself requires approval:
+Invoke `ya make` directly as the executed command. Do not wrap it in
+`set -o pipefail`, `bash -lc`, or another shell, and do not add output
+redirection or pipelines through tools such as `tee` or `tail`. Let the host's
+execution tool limit displayed output. Direct execution preserves the
+`ya make` exit status without `pipefail` and lets the reusable approval rule
+match from any YDB working directory.
+
+The user has pre-authorized every command that starts with:
 
 ```text
 ya make
-set -o pipefail; ya make
-/usr/bin/bash -lc "set -o pipefail; ya make
 ```
+
+When `ya make` needs the tool-cache daemon outside the sandbox, request that
+access on the first attempt instead of first running a command that is known to
+fail inside the sandbox. In Codex, use the reusable approval prefix
+`["ya", "make"]`; do not request approval for the full argument list.
 
 ## Test rules
 
