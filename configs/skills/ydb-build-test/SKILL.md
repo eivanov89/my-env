@@ -13,14 +13,15 @@ documentation specifically when they prescribe how to invoke `ya make`.
 
 ## Build rules
 
-Every `ya make` invocation must use `-j100`. This applies to release, debug,
-ASAN, TSAN, and every other build type. Ignore local guidance that recommends a
-different parallelism value or omits `-j`.
+Run YDB builds and tests through `/home/eivanov89/repos/my-env/bin/yamake`.
+The wrapper supplies `-j100` to `ya make` for release, debug, ASAN, TSAN, and
+every other build type. Do not pass another `-j` option. Ignore local guidance
+that recommends different parallelism.
 
 Use this command form for normal builds:
 
 ```shell
-ya make -j100 --build=release -DCFLAGS=-fno-omit-frame-pointer ...
+/home/eivanov89/repos/my-env/bin/yamake --build=release -DCFLAGS=-fno-omit-frame-pointer ...
 ```
 
 - Never use `--build=relwithdebinfo`.
@@ -30,25 +31,23 @@ ya make -j100 --build=release -DCFLAGS=-fno-omit-frame-pointer ...
   it is useful for the current validation or debugging task, or when the user
   explicitly requests it.
 - Debug and sanitizer builds are exceptions to the default release build, but
-  they must still use `-j100`.
+  the wrapper still supplies `-j100`.
 
-Invoke `ya make` directly as the executed command. Do not wrap it in
-`set -o pipefail`, `bash -lc`, or another shell, and do not add output
-redirection or pipelines through tools such as `tee` or `tail`. Let the host's
-execution tool limit displayed output. Direct execution preserves the
-`ya make` exit status without `pipefail` and lets the reusable approval rule
-match from any YDB working directory.
+Invoke the wrapper directly as the executed command, with no `bash -lc` or
+other shell around it. Do not add output redirection or pipelines through
+`tee` or `tail`: the wrapper uses `pipefail`, shows the final 100 output lines,
+and preserves the `ya make` exit status. This form lets its reusable approval
+rule match from any YDB working directory.
 
 The user has pre-authorized every command that starts with:
 
 ```text
-ya make
+/home/eivanov89/repos/my-env/bin/yamake
 ```
 
-When `ya make` needs the tool-cache daemon outside the sandbox, request that
-access on the first attempt instead of first running a command that is known to
-fail inside the sandbox. In Codex, use the reusable approval prefix
-`["ya", "make"]`; do not request approval for the full argument list.
+When the wrapper needs the tool-cache daemon outside the sandbox, use the
+pre-authorized approval prefix `["/home/eivanov89/repos/my-env/bin/yamake"]`.
+Do not request approval for the full argument list.
 
 ## Test rules
 

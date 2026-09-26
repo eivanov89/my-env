@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+ya make -j100 "$@" 2>&1 | tail -n 100
