@@ -63,7 +63,7 @@ subagent using the model specified for that host:
 
 - In Codex, use `gpt-5.6-luna`. When the interface requires a limited-context
   fork for model overrides, use a limited or no-history fork.
-- In Cursor, use `Grok 4.6 Medium`.
+- In Cursor, use `Grok 4.7 Medium`.
 
 Do not silently substitute another model. If the requested model is unavailable,
 report that limitation to the calling agent.
