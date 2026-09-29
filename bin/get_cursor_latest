@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Print the newest non-fast Cursor model for a family and effort."""
+
+import re
+import subprocess
+import sys
+
+
+USAGE = "Usage: get_cursor_latest [opus|sonnet|grok] [high|medium]"
+FAMILIES = {"opus", "sonnet", "grok"}
+EFFORTS = {"high", "medium"}
+
+
+def model_details(model_id, family, effort):
+    if model_id.endswith("-fast"):
+        return None
+
+    if family == "grok":
+        match = re.fullmatch(r"(?:cursor-)?grok-(\d+(?:[.-]\d+)*)-(high|medium)", model_id)
+        if not match or match.group(2) != effort:
+            return None
+        return tuple(map(int, re.split(r"[.-]", match.group(1)))), False
+
+    match = re.fullmatch(
+        rf"claude-{family}-(\d+(?:[.-]\d+)*)(-thinking)?-(high|medium)",
+        model_id,
+    )
+    if match and match.group(3) == effort:
+        return tuple(map(int, re.split(r"[.-]", match.group(1)))), bool(match.group(2))
+
+    # Cursor also lists older Claude versions with the version before the family.
+    match = re.fullmatch(
+        rf"claude-(\d+(?:[.-]\d+)*)-{family}-(high|medium)(-thinking)?",
+        model_id,
+    )
+    if match and match.group(2) == effort:
+        return tuple(map(int, re.split(r"[.-]", match.group(1)))), bool(match.group(3))
+    return None
+
+
+def main():
+    if len(sys.argv) > 3:
+        print(USAGE, file=sys.stderr)
+        return 2
+    family = sys.argv[1] if len(sys.argv) >= 2 else "opus"
+    effort = sys.argv[2] if len(sys.argv) == 3 else "high"
+    if family not in FAMILIES or effort not in EFFORTS:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    try:
+        result = subprocess.run(["agent", "models"], capture_output=True, text=True, check=False)
+    except OSError as error:
+        print(f"Cannot run agent models: {error}", file=sys.stderr)
+        return 1
+    if result.returncode:
+        print(result.stderr.strip() or result.stdout.strip() or "agent models failed", file=sys.stderr)
+        return result.returncode
+
+    candidates = []
+    for line in result.stdout.splitlines():
+        model_id = line.partition(" - ")[0].strip()
+        details = model_details(model_id, family, effort)
+        if details is not None:
+            candidates.append((details[0], details[1], model_id))
+    if not candidates:
+        print(f"No non-fast {family} {effort} model found in agent models", file=sys.stderr)
+        return 1
+
+    print(max(candidates)[2])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
