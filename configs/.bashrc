@@ -49,6 +49,7 @@ function __prompt_command() {
     local Gre='\[\e[0;32m\]'
     local BBlu='\[\033[36m\]'
     local Pur='\[\e[0;35m\]'
+    local prompt_host="${PROMPT_HOST_LABEL:-\\h}"
 
     local status=""
     if (( EXIT != 0 )); then
@@ -59,9 +60,9 @@ function __prompt_command() {
 
     if [[ -n "$SYS_VERSION" ]]
     then
-        PS1="${Pur}\w\n$status${RCol}@${BBlu}\h${RCol}:$SYS_VERSION> "
+        PS1="${Pur}\w\n$status${RCol}@${BBlu}${prompt_host}${RCol}:$SYS_VERSION> "
     else
-        PS1="${Pur}\w\n$status${RCol}@${BBlu}\h${RCol}> "
+        PS1="${Pur}\w\n$status${RCol}@${BBlu}${prompt_host}${RCol}> "
     fi
 }
 
@@ -132,10 +133,17 @@ function __list_entry_names() {
                 __print_entry_name "${record#* }"
             done < <(
                 if (( include_hidden )); then
-                    command find "$root" -mindepth 1 -maxdepth 1 -printf '%T@ %p\0'
+                    command find "$root" -mindepth 1 -maxdepth 1 -print0
                 else
-                    command find "$root" -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%T@ %p\0'
-                fi | command sort -zn
+                    command find "$root" -mindepth 1 -maxdepth 1 ! -name '.*' -print0
+                fi | while IFS= read -r -d '' entry; do
+                    if [[ "$OSTYPE" == darwin* ]]; then
+                        mtime="$(command stat -f %m "$entry")"
+                    else
+                        mtime="$(command stat -c %Y "$entry")"
+                    fi
+                    printf '%s %s\0' "$mtime" "$entry"
+                done | command sort -zn
             )
         else
             while IFS= read -r -d '' entry; do
@@ -208,14 +216,20 @@ function __path_dedupe() {
     local entry deduped_path=""
     local first=1
     local -a path_entries
-    local -A seen
+    local -a seen=()
+    local seen_entry already_seen
 
     IFS=: read -r -a path_entries <<< "$PATH"
     for entry in "${path_entries[@]}"; do
-        if [[ -n "${seen["entry:$entry"]+present}" ]]; then
-            continue
-        fi
-        seen["entry:$entry"]=1
+        already_seen=0
+        for seen_entry in "${seen[@]}"; do
+            if [[ "$seen_entry" == "$entry" ]]; then
+                already_seen=1
+                break
+            fi
+        done
+        (( already_seen )) && continue
+        seen+=("$entry")
 
         if (( first )); then
             deduped_path="$entry"

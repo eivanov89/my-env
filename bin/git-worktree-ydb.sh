@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 _git_worktree_ydb_create() {
-    local ydb_main="/home/eivanov89/repos/ydb_main"
-    local worktree_root="/home/eivanov89/repos/ydb_worktrees"
+    local ydb_main="$HOME/repos/ydb_main"
+    local worktree_root="$HOME/repos/ydb_worktrees"
     local name="${1-}"
     local revision="${2:-main}"
     local worktree_path

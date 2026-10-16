@@ -4,7 +4,16 @@ if [[ -r "$HOME/ydb/path.bash.inc" && ":$PATH:" != *":$HOME/ydb/bin:"* ]]; then
     source "$HOME/ydb/path.bash.inc"
 fi
 
-export BUILD_CORES="${BUILD_CORES:-$(nproc --ignore=2)}"
+if [[ -z "${BUILD_CORES:-}" ]]; then
+    if [[ "$OSTYPE" == darwin* ]]; then
+        __ydb_logical_cores="$(getconf NPROCESSORS_ONLN)"
+        BUILD_CORES=$((__ydb_logical_cores > 2 ? __ydb_logical_cores - 2 : 1))
+        unset __ydb_logical_cores
+    else
+        BUILD_CORES="$(nproc --ignore=2)"
+    fi
+fi
+export BUILD_CORES
 
 alias cds='cd ~/repos/ydb'
 alias cdm='cd ~/repos/ydb_main'
