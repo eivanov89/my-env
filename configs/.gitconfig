@@ -11,3 +11,6 @@
 	excludesfile = /home/eivanov89/repos/my-env/configs/.gitignore_global
 [push]
 	autoSetupRemote = true
+[color "branch"]
+	current = "bold #155B73"
+	local = "#45454D"
