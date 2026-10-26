@@ -8,9 +8,15 @@ if [[ -z "${BUILD_CORES:-}" ]]; then
     if [[ "$OSTYPE" == darwin* ]]; then
         __ydb_logical_cores="$(getconf NPROCESSORS_ONLN)"
         BUILD_CORES=$((__ydb_logical_cores > 2 ? __ydb_logical_cores - 2 : 1))
+        if (( BUILD_CORES > 8 )); then
+            BUILD_CORES=8
+        fi
         unset __ydb_logical_cores
     else
-        BUILD_CORES="$(nproc --ignore=2)"
+        BUILD_CORES="$(nproc --ignore=4)"
+        if (( BUILD_CORES > 100 )); then
+            BUILD_CORES=100
+        fi
     fi
 fi
 export BUILD_CORES
