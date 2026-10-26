@@ -23,6 +23,7 @@ export BUILD_CORES
 
 alias cds='cd ~/repos/ydb'
 alias cdm='cd ~/repos/ydb_main'
+alias cdw='cd ~/repos/ydb_worktrees'
 
 function ymake_impl() {
     local profile="$1"
