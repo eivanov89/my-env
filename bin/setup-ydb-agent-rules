@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Install private YDB instructions without changing tracked checkout files."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+BEGIN = "# BEGIN personal-ydb-agent-rules (managed by setup-ydb-agent-rules)"
+END = "# END personal-ydb-agent-rules"
+SHIM = "<!-- Managed by setup-ydb-agent-rules. Edit AGENTS.ydb.md instead. -->\n@./AGENTS.override.md\n"
+HOOK = 'python3 "$HOME/repos/my-env/bin/setup-ydb-agent-rules" --repo "$PWD"'
+CURSOR_SCRIPT = "setup-personal-ydb.sh"
+CURSOR_HEADER = "# Managed by setup-ydb-agent-rules."
+CURSOR_PREVIOUS = "# Previous setup: "
+FILES = (
+    "AGENTS.override.md",
+    "CLAUDE.local.md",
+    ".cursor/rules/personal-ydb.mdc",
+    ".claude/settings.local.json",
+    ".cursorignore",
+    ".cursor/worktrees.json",
+    ".cursor/setup-personal-ydb.sh",
+    ".codex/environments/environment.toml",
+)
+
+
+def git(root, *args):
+    result = subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "Git command failed")
+    return result.stdout.rstrip("\n")
+
+
+def ydb_root(path):
+    root = Path(git(path, "rev-parse", "--show-toplevel")).resolve()
+    tracked = set(git(root, "ls-files", "-z", "--", "ya", "ydb/ya.make").split("\0"))
+    remotes = git(root, "remote", "-v")
+    if not {"ya", "ydb/ya.make"}.issubset(tracked) or not any(
+        re.search(r"(?:^|[/ :])ydb(?:\.git)?/?$", line.split()[1])
+        for line in remotes.splitlines() if len(line.split()) >= 2
+    ):
+        raise ValueError("Not a recognized YDB repository: {}".format(root))
+    return root
+
+
+def common_dir(root):
+    return (root / git(root, "rev-parse", "--git-common-dir")).resolve()
+
+
+def report_visible_files(root):
+    visible = []
+    for name in FILES:
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--quiet", "--no-index", "--", name],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 1:
+            visible.append(name)
+        elif result.returncode:
+            raise ValueError(result.stderr.strip() or "Git ignore check failed")
+    if visible:
+        print("Warning: repository ignore rules override local exclusions in {}: {}. "
+              "These private paths remain visible to Git; stage code paths explicitly. "
+              "The tracked .gitignore was not changed.".format(root, ", ".join(visible)), file=sys.stderr)
+
+
+def all_roots(home):
+    seeds = home / "repos"
+    roots = set()
+    seen = set()
+    for candidate in sorted(seeds.iterdir()) if seeds.is_dir() else []:
+        if not (candidate / ".git").exists():
+            continue
+        try:
+            root = ydb_root(candidate)
+        except ValueError:
+            continue
+        common = common_dir(root)
+        if common in seen:
+            continue
+        seen.add(common)
+        for entry in git(root, "worktree", "list", "--porcelain", "-z").split("\0"):
+            if entry.startswith("worktree "):
+                worktree = Path(entry[len("worktree "):])
+                if worktree.is_dir():
+                    roots.add(ydb_root(worktree))
+    if not roots:
+        raise ValueError("No YDB checkouts found under {}".format(seeds))
+    return sorted(roots)
+
+
+def regular_text(path):
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("Expected a regular file: {}".format(path))
+    return path.read_text() if path.exists() else ""
+
+
+def block(text, lines):
+    replacement = "\n".join([BEGIN, *lines, END]) + "\n"
+    if BEGIN not in text and END not in text:
+        return text + ("\n" if text and not text.endswith("\n") else "") + replacement
+    if text.count(BEGIN) != 1 or text.count(END) != 1:
+        raise ValueError("Malformed managed instruction block")
+    pattern = re.compile(r"^" + re.escape(BEGIN) + r"\n.*?^" + re.escape(END) + r"(?:\n|$)", re.M | re.S)
+    updated, count = pattern.subn(lambda _: replacement, text)
+    if count != 1:
+        raise ValueError("Malformed managed instruction block")
+    return updated
+
+
+def json_object(path):
+    text = regular_text(path)
+    value = json.loads(text) if text else {}
+    if not isinstance(value, dict):
+        raise ValueError("Expected a JSON object: {}".format(path))
+    return value
+
+
+def json_text(value):
+    return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+
+
+def toml_text(value):
+    """Serialize the local-environment schema, retaining unrelated values."""
+    def scalar(item):
+        if isinstance(item, str):
+            return json.dumps(item, ensure_ascii=False)
+        if isinstance(item, bool):
+            return "true" if item else "false"
+        if isinstance(item, (int, float)):
+            return str(item)
+        if isinstance(item, list):
+            return "[" + ", ".join(scalar(entry) for entry in item) + "]"
+        if isinstance(item, dict):
+            return "{ " + ", ".join(json.dumps(key) + " = " + scalar(val) for key, val in item.items()) + " }"
+        raise ValueError("Unsupported local-environment TOML value: {}".format(type(item).__name__))
+
+    return "# Managed setup command; existing settings and actions are retained.\n" + "".join(
+        json.dumps(key) + " = " + scalar(item) + "\n" for key, item in value.items()
+    )
+
+
+def environment(path):
+    text = regular_text(path)
+    if text:
+        try:
+            import tomllib
+        except ImportError:
+            raise ValueError("Python 3.11+ is required to merge an existing Codex environment")
+        data = tomllib.loads(text)
+    else:
+        data = {"version": 1, "name": "Personal YDB", "setup": {"script": ""}}
+    setup = data.setdefault("setup", {"script": ""})
+    if not isinstance(setup, dict):
+        raise ValueError("Expected a Codex setup table: {}".format(path))
+    for entry in [setup] + [setup[key] for key in ("darwin", "linux") if key in setup]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("script", ""), str):
+            raise ValueError("Expected a Codex setup script: {}".format(path))
+        command = HOOK + " || exit $?"
+        script = entry.get("script", "")
+        if command not in script.splitlines():
+            entry["script"] = command + ("\n" + script if script else "")
+    return toml_text(data)
+
+
+def cursor_script(previous):
+    if not isinstance(previous, dict) or set(previous) not in ({"script"}, {"commands"}):
+        raise ValueError("Invalid previous Cursor setup metadata")
+    if "script" in previous and not isinstance(previous["script"], str):
+        raise ValueError("Expected a previous Cursor script path")
+    if "commands" in previous and (
+        not isinstance(previous["commands"], list)
+        or any(not isinstance(command, str) for command in previous["commands"])
+    ):
+        raise ValueError("Expected previous Cursor setup commands")
+    text = "\n".join([
+        "#!/usr/bin/env bash", CURSOR_HEADER,
+        CURSOR_PREVIOUS + json.dumps(previous, ensure_ascii=False),
+        "set -e", HOOK + " || exit $?",
+    ]) + "\n"
+    if "script" in previous:
+        text += 'bash "$(dirname -- "${BASH_SOURCE[0]}")"/' + shlex.quote(previous["script"]) + ' "$PWD"\n'
+    else:
+        text += "".join("sh -c " + shlex.quote(command) + "\n" for command in previous["commands"])
+    return text
+
+
+def cursor_setup(root, settings):
+    path = root / ".cursor" / CURSOR_SCRIPT
+    current = regular_text(path)
+    original = settings.get("setup-worktree-unix")
+    if original == CURSOR_SCRIPT:
+        lines = current.splitlines()
+        if len(lines) < 3 or lines[1] != CURSOR_HEADER or not lines[2].startswith(CURSOR_PREVIOUS):
+            raise ValueError("Unrecognized managed Cursor setup script: {}".format(path))
+        previous = json.loads(lines[2][len(CURSOR_PREVIOUS):])
+        if current != cursor_script(previous):
+            raise ValueError("Cursor setup script was edited; preserve those edits before reinstalling: {}".format(path))
+    elif isinstance(original, str):
+        base = (root / ".cursor").resolve()
+        if not (base / original).resolve().is_relative_to(base):
+            raise ValueError("Cursor setup script must remain inside .cursor")
+        previous = {"script": original}
+    else:
+        commands = original if original is not None else settings.get("setup-worktree", [])
+        if isinstance(commands, str):
+            commands = [commands]
+        if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):
+            raise ValueError("Expected Cursor setup commands or a script path")
+        previous = {"commands": [item for item in commands if item != HOOK]}
+    generated = cursor_script(previous)
+    if current and current != generated:
+        raise ValueError("Refusing to overwrite existing Cursor setup script: {}".format(path))
+    settings["setup-worktree-unix"] = CURSOR_SCRIPT
+    return generated
+
+
+class Installation:
+    def __init__(self):
+        self.changes = {}
+
+    def put(self, path, content, symlink=False):
+        if symlink:
+            if path.is_symlink() and os.readlink(path) == str(content):
+                return
+            if path.exists() or path.is_symlink():
+                raise ValueError("Refusing to replace an unfamiliar path: {}".format(path))
+        elif regular_text(path) == content and path.exists():
+            return
+        change = ("link" if symlink else "write", str(content))
+        if path in self.changes and self.changes[path] != change:
+            raise ValueError("Conflicting planned writes: {}".format(path))
+        self.changes[path] = change
+
+    def checkout(self, root, source):
+        for name in FILES:
+            path = root / name
+            if git(root, "ls-files", "-z", "--", name):
+                raise ValueError("Refusing to modify tracked configuration: {}".format(path))
+            for parent in path.parents:
+                if parent == root:
+                    break
+                if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                    raise ValueError("Expected a local directory: {}".format(parent))
+        self.put(root / "AGENTS.override.md", source, symlink=True)
+        self.put(root / ".cursor/rules/personal-ydb.mdc", source, symlink=True)
+        shim = root / "CLAUDE.local.md"
+        if (shim.exists() or shim.is_symlink()) and regular_text(shim) != SHIM:
+            raise ValueError("Refusing to replace personal Claude instructions: {}".format(shim))
+        self.put(shim, SHIM)
+
+        settings_path = root / ".claude/settings.local.json"
+        settings = json_object(settings_path)
+        excludes = settings.setdefault("claudeMdExcludes", [])
+        if not isinstance(excludes, list) or any(not isinstance(item, str) for item in excludes):
+            raise ValueError("Expected a claudeMdExcludes string array")
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            path = str(root / name)
+            # Claude matches globs against absolute paths, so escape literal metacharacters.
+            pattern = re.sub(r"([*?\[\]{}!()])", r"\\\1", path)
+            if pattern not in excludes:
+                excludes.append(pattern)
+        self.put(settings_path, json_text(settings))
+
+        ignore = root / ".cursorignore"
+        self.put(ignore, block(regular_text(ignore), ["/AGENTS.md", "/CLAUDE.md", "/CLAUDE.local.md"]))
+        cursor_path = root / ".cursor/worktrees.json"
+        cursor = json_object(cursor_path)
+        self.put(root / ".cursor" / CURSOR_SCRIPT, cursor_setup(root, cursor))
+        self.put(cursor_path, json_text(cursor))
+        self.put(root / ".codex/environments/environment.toml", environment(root / ".codex/environments/environment.toml"))
+
+        exclude_path = common_dir(root) / "info/exclude"
+        current = self.changes.get(exclude_path)
+        text = current[1] if current else regular_text(exclude_path)
+        self.put(exclude_path, block(text, ["/" + name for name in FILES]))
+
+    def migrate_global(self, home, source):
+        legacy = source.parent / "AGENTS.md"
+        for path in (home / "AGENTS.md", home / ".codex/AGENTS.md"):
+            if not path.exists() and not path.is_symlink():
+                continue
+            if not path.is_symlink() or path.resolve() not in (legacy, source):
+                raise ValueError("Refusing to remove unfamiliar global instructions: {}".format(path))
+            self.changes[path] = ("unlink", "")
+
+    def apply(self, readonly):
+        for path, (operation, content) in self.changes.items():
+            print("{} {}".format(operation, path))
+            if readonly:
+                continue
+            if operation == "unlink":
+                path.unlink()
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if operation == "link":
+                path.symlink_to(content)
+            else:
+                fd, temp = tempfile.mkstemp(prefix=".ydb-rules-", dir=str(path.parent))
+                try:
+                    with os.fdopen(fd, "w") as output:
+                        output.write(content)
+                    if path.exists():
+                        os.chmod(temp, path.stat().st_mode & 0o777)
+                    os.replace(temp, path)
+                finally:
+                    if os.path.exists(temp):
+                        os.unlink(temp)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--repo", type=Path, help="YDB checkout or a directory within it")
+    selection.add_argument("--all", action="store_true", help="all YDB worktrees discovered from ~/repos/*")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--check", action="store_true", help="exit 1 if configuration needs changes")
+    parser.add_argument("--migrate-global", action="store_true", help="remove only the known global YDB symlinks")
+    args = parser.parse_args()
+    try:
+        if sys.version_info < (3, 11):
+            raise ValueError("Python 3.11 or later is required")
+        home = Path.home().resolve()
+        source = home / "repos/my-env-private/ai/AGENTS.ydb.md"
+        if not source.is_file():
+            raise ValueError("Missing private instructions: {}".format(source))
+        if not (home / ".agents/skills/ydb-build-test/SKILL.md").is_file():
+            raise ValueError("Missing ydb-build-test skill; run refresh_agent_setup.sh first")
+        roots = all_roots(home) if args.all else [ydb_root(args.repo)]
+        installation = Installation()
+        for root in roots:
+            installation.checkout(root, source)
+        if args.migrate_global:
+            installation.migrate_global(home, source)
+        installation.apply(args.dry_run or args.check)
+        if not args.dry_run:
+            for root in roots:
+                report_visible_files(root)
+        print("{} {} YDB checkout(s); {} change(s).".format(
+            "Checked" if args.check else "Planned" if args.dry_run else "Configured",
+            len(roots), len(installation.changes),
+        ))
+        return int(args.check and bool(installation.changes))
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print("Error: {}".format(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

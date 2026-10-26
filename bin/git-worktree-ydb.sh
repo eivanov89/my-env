@@ -37,6 +37,11 @@ _git_worktree_ydb_create() {
         return 1
     fi
 
+    if [[ ! -x "$HOME/repos/my-env/bin/setup-ydb-agent-rules" ]]; then
+        printf 'Error: missing YDB instruction installer\n' >&2
+        return 1
+    fi
+
     if git -C "$ydb_main" show-ref --verify --quiet "refs/heads/$name"; then
         if ! git -C "$ydb_main" worktree add "$worktree_path" "$name"; then
             return 1
@@ -47,6 +52,11 @@ _git_worktree_ydb_create() {
             return 1
         fi
         printf 'Created branch %s from %s\n' "$name" "$revision"
+    fi
+
+    if ! "$HOME/repos/my-env/bin/setup-ydb-agent-rules" --repo "$worktree_path"; then
+        printf 'Error: worktree created at %s, but instruction setup failed; fix it before using the worktree\n' "$worktree_path" >&2
+        return 1
     fi
 
     YDB_WORKTREE_YDB_PATH="$worktree_path"
