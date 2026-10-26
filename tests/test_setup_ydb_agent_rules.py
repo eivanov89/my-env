@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin/setup-ydb-agent-rules"
@@ -232,6 +233,15 @@ class InstallerTest(unittest.TestCase):
         before = path.read_bytes()
         self.run_installer("--repo", self.root, code=2)
         self.assertEqual(path.read_bytes(), before)
+
+    def test_managed_environment_without_external_toml_parser(self):
+        data = {"version": 1, "name": "YDB", "setup": {"script": 'echo "x = y"\necho \\path', "linux": {"script": "echo linux"}}, "actions": [{"name": "Run", "command": "echo run", "icon": "run"}]}
+        with patch.dict("sys.modules", {"tomllib": None, "tomli": None}):
+            self.assertEqual(rules.load_environment(rules.toml_text(data)), data)
+            with self.assertRaisesRegex(ValueError, "Python 3.11"):
+                rules.load_environment('[setup]\nscript = "echo existing"\n')
+            with self.assertRaisesRegex(ValueError, "Python 3.11"):
+                rules.load_environment(rules.toml_text(data) + "# user formatting\n")
 
 
 if __name__ == "__main__":

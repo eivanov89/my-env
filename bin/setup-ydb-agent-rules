@@ -149,14 +149,43 @@ def toml_text(value):
     )
 
 
+def load_environment(text):
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            # Our serializer emits JSON-compatible values with TOML '=' separators.
+            # Accept only its exact output; arbitrary user TOML needs a full parser.
+            message = "Python 3.11+ or tomli is required to merge this Codex environment"
+            if not text.startswith("# Managed setup command; existing settings and actions are retained.\n"):
+                raise ValueError(message)
+            try:
+                data = {}
+                decoder = json.JSONDecoder()
+                for line in text.splitlines()[1:]:
+                    key, end = decoder.raw_decode(line)
+                    if not isinstance(key, str) or line[end:end + 3] != " = ":
+                        raise ValueError(message)
+                    value = re.sub(
+                        r'"(?:\\.|[^"\\])*"|=',
+                        lambda match: ":" if match.group(0) == "=" else match.group(0),
+                        line[end + 3:],
+                    )
+                    data[key] = json.loads(value)
+                if toml_text(data) != text:
+                    raise ValueError(message)
+                return data
+            except (ValueError, TypeError):
+                raise ValueError(message)
+    return tomllib.loads(text)
+
+
 def environment(path):
     text = regular_text(path)
     if text:
-        try:
-            import tomllib
-        except ImportError:
-            raise ValueError("Python 3.11+ is required to merge an existing Codex environment")
-        data = tomllib.loads(text)
+        data = load_environment(text)
     else:
         data = {"version": 1, "name": "Personal YDB", "setup": {"script": ""}}
     setup = data.setdefault("setup", {"script": ""})
@@ -207,7 +236,9 @@ def cursor_setup(root, settings):
             raise ValueError("Cursor setup script was edited; preserve those edits before reinstalling: {}".format(path))
     elif isinstance(original, str):
         base = (root / ".cursor").resolve()
-        if not (base / original).resolve().is_relative_to(base):
+        try:
+            (base / original).resolve().relative_to(base)
+        except ValueError:
             raise ValueError("Cursor setup script must remain inside .cursor")
         previous = {"script": original}
     else:
@@ -328,8 +359,8 @@ def main():
     parser.add_argument("--migrate-global", action="store_true", help="remove only the known global YDB symlinks")
     args = parser.parse_args()
     try:
-        if sys.version_info < (3, 11):
-            raise ValueError("Python 3.11 or later is required")
+        if sys.version_info < (3, 8):
+            raise ValueError("Python 3.8 or later is required")
         home = Path.home().resolve()
         source = home / "repos/my-env-private/ai/AGENTS.ydb.md"
         if not source.is_file():
