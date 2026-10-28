@@ -10,8 +10,8 @@ The main agent owns fixes and validation. Reviewers are independent and read-onl
 ## Resolve the request
 
 - Use the main agent's model for self-review unless the prompt specifies `self=X`, where `X` selects the reviewer model. Preserve any explicit effort setting. Do not silently substitute a model if the requested selection is unavailable.
-- Allow at most **three self-review attempts**. The external stage also defaults to **three attempts**, but a user-specified attempt count applies only to the external stage. Accept a positive integer; clarify an invalid or ambiguous count before running that stage.
-- An attempt is one reviewer invocation, including the initial review and any failed or incomplete invocation. Keep separate counters for the two stages. Fixes, tests, and the final recovery analysis are not review attempts.
+- Allow at most **three attempts per self-review correctness loop**. Each external correctness loop also defaults to **three attempts**, but a user-specified attempt count applies only to the external stage's correctness loops. Accept a positive integer; clarify an invalid or ambiguous count before running that stage. Each stage additionally has one dedicated simplification and scope review.
+- An attempt is one reviewer invocation, including the initial review and any failed or incomplete invocation. Keep separate counters for each correctness loop and record the dedicated simplification and scope reviews separately. Fixes, tests, and the final recovery analysis are not review attempts.
 - Use the external reviewer, command, or skill specified by the user. If none is specified, run self-review only and report the external stage as omitted. Do not choose an external service on the user's behalf.
 - Use the established task requirements and review scope. Otherwise review tracked changes relative to `HEAD` plus nonignored untracked files in the current repository. Establish the baseline once; subsequent attempts must review the updated changes, including fixes, against that baseline. Never keep reviewing an immutable original commit while claiming its fixes were reviewed. If the selected reviewer cannot cover the updated scope, report that limitation.
 - Before starting, briefly state the scope, selected reviewers, and attempt budgets. If a required model, tool, or skill is unavailable, report the blocker rather than replacing it or pretending the review occurred. Preserve any completed stage's results.
@@ -25,7 +25,7 @@ Provide a compact review brief containing:
 - The user's objective, acceptance criteria, and relevant constraints.
 - The repository/workspace location, baseline, current scope, and how to inspect the complete current changes, including untracked files.
 - Relevant architecture or invariant references and factual validation results, including checks not run.
-- Instructions to inspect surrounding code, report substantive correctness or maintainability issues with severity, file/line, evidence, impact, and a suggested remedy, and explicitly state whether the review was complete.
+- The current review focus: correctness, or simplification and scope. Ask reviewers to inspect surrounding code, report substantive findings with severity, file/line, evidence, impact, and a suggested remedy, and explicitly state whether the review was complete.
 
 Ask for an explicit statement when there are no substantive findings. Do not seed the reviewer with the main agent's preferred conclusion or paste the implementation conversation. Reviewers must not edit files, invoke this loop recursively, or delegate fixes. The main agent must not change the review target while a reviewer is inspecting it.
 
@@ -33,14 +33,23 @@ For an external reviewer, read and follow its skill when supplied, retaining its
 
 ## Run each stage
 
-1. Increment the stage's counter and invoke its reviewer on the current changes. Retain the returned findings, completion status, and execution errors.
+Complete the following sequence for self-review before starting the external stage, then repeat it with the selected external reviewer:
+
+1. Run the correctness loop below until it succeeds.
+2. Run one dedicated, read-only review for simplification and scope. In the self-review stage, use a fresh independent subagent under the same model and context rules as correctness reviews; in the external stage, use the selected external reviewer. Ask it to identify unnecessary complexity, redundant logic or abstractions, and changes unrelated to the user's objective. Favor concrete simplifications that preserve required behavior over stylistic preferences or broader refactoring.
+3. Evaluate every finding against the requirements. Apply justified simplifications and remove unrelated changes introduced by this task, preserving pre-existing user work. Record rejected suggestions with brief reasons and run relevant validation. If this review fails or is incomplete, stop and report the limitation rather than claiming the stage succeeded.
+4. Run the correctness loop again on the resulting changes, even if no simplification or scope changes were accepted. Only after this loop succeeds is the stage complete. Do not repeat the simplification and scope pass within the same stage.
+
+### Correctness loop
+
+1. Increment the current loop's counter and invoke its reviewer on the current changes, focusing first on correctness, regressions, and required behavior. Retain the returned findings, completion status, and execution errors.
 2. Check every substantive finding against the actual code and requirements. Record which findings are confirmed, resolved, or rejected, with brief reasons. Unsupported findings do not require fixes or another attempt. A previously confirmed issue remains unresolved until there is evidence it was addressed; omission from a later review is not evidence by itself.
 3. If the review failed or was incomplete, never treat an empty finding list as success. If the budget is exhausted, perform the recovery analysis below. Otherwise retry only when another invocation can usefully complete the review; if it cannot, stop and report the blocker.
-4. If a complete review leaves no unresolved substantive findings and required validation has passed, the stage succeeds. After self-review succeeds, run the external stage if one was specified. After external success, or self-review success without an external reviewer, report the result and stop.
+4. If a complete review leaves no unresolved substantive findings and required validation has passed, this correctness loop succeeds. Continue to the next step of the stage sequence. After the entire self-review stage succeeds, run the external stage if one was specified. After the entire external stage succeeds, or self-review succeeds without an external reviewer, report the result and stop.
 5. If confirmed issues or required validation failures remain and another attempt is available, make the scoped fixes and run relevant checks before requesting the next review. This also applies when a reviewer finds no issues but checks fail. Never label the stage successful while required checks are failing or unavailable. Report a blocker if progress requires missing access, information, or authorization.
 6. If confirmed issues or required validation failures remain on the last allowed attempt, **stop before making further fixes** and perform the recovery analysis. This prevents ending the loop with fixes that have not been reviewed.
 
-External-stage fixes stay within that stage. Do not restart self-review, reset a counter, switch reviewers to obtain a favorable verdict, or add an extra confirmation review after exhausting the budget. Self-review exhaustion prevents the external stage from starting.
+External-stage fixes stay within that stage. The two correctness loops have separate budgets established at the outset; do not restart a completed loop, reset a counter, switch reviewers to obtain a favorable verdict, or add an extra confirmation review after exhausting a loop's budget. Exhaustion of either correctness loop triggers recovery analysis and stops the run; self-review exhaustion prevents the external stage from starting.
 
 ## Recovery analysis after exhaustion
 
@@ -59,6 +68,6 @@ After receiving the analysis, stop. Do not implement its recommendations, contin
 
 ## Report to the user
 
-Summarize the scope, reviewers/models, attempts used versus each budget, confirmed issues fixed, and validation performed. Include any rejected substantive findings with concise reasons, unresolved findings with severity and locations, and skipped or incomplete stages. When recovery analysis ran, attribute its conclusions separately and give its recommended next steps.
+Summarize the scope, reviewers/models, attempts used versus each correctness loop's budget, simplification and scope review results, confirmed issues fixed, and validation performed. Include any rejected substantive findings with concise reasons, unresolved findings with severity and locations, and skipped or incomplete stages. When recovery analysis ran, attribute its conclusions separately and give its recommended next steps.
 
 Clearly distinguish a clean review from budget exhaustion, incomplete review, and blocked validation. Do not claim that an omitted stage ran or that proposed recovery work has been implemented.
