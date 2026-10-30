@@ -248,3 +248,5 @@ done
 unset i
 __path_dedupe
 export PATH
+
+[[ -f ~/.claude-oauth-token ]] && export CLAUDE_CODE_OAUTH_TOKEN="$(< ~/.claude-oauth-token)"
